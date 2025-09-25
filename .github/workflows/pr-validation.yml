@@ -1,0 +1,161 @@
+name: PR Validation
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened, ready_for_review]
+    # Estes são os "bases" permitidos
+    branches:
+      - develop
+      - sandbox
+      - production
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # histórico completo para validar commits
+
+      - name: Show PR refs
+        run: |
+          echo "HEAD_REF=${GITHUB_HEAD_REF}"
+          echo "BASE_REF=${GITHUB_BASE_REF}"
+
+      # --------- Regras de fluxo (pipeline gates) ----------
+      - name: Enforce allowed promotion paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          HEAD="${GITHUB_HEAD_REF}"
+          BASE="${GITHUB_BASE_REF}"
+
+          is_feature_like() {
+            [[ "$1" =~ ^(feature|bugfix|hotfix|release)/.+$ ]]
+          }
+
+          case "$BASE" in
+            develop)
+              if is_feature_like "$HEAD"; then
+                echo "✅ Fluxo permitido: $HEAD -> $BASE"
+              else
+                echo "❌ Fluxo bloqueado: Só é permitido abrir PR para 'develop' a partir de branches do tipo feature/ bugfix/ hotfix/ release."
+                echo "   Recebido: $HEAD -> $BASE"
+                exit 1
+              fi
+              ;;
+            sandbox)
+              if [[ "$HEAD" == "develop" ]]; then
+                echo "✅ Fluxo permitido: develop -> sandbox"
+              else
+                echo "❌ Fluxo bloqueado: Para 'sandbox', só é permitido PR vindo de 'develop'."
+                echo "   Recebido: $HEAD -> $BASE"
+                exit 1
+              fi
+              ;;
+            production)
+              if [[ "$HEAD" == "sandbox" ]]; then
+                echo "✅ Fluxo permitido: sandbox -> production"
+              else
+                echo "❌ Fluxo bloqueado: Para 'production', só é permitido PR vindo de 'sandbox'."
+                echo "   Recebido: $HEAD -> $BASE"
+                exit 1
+              fi
+              ;;
+            *)
+              echo "❌ Base inválida: $BASE. As bases permitidas são: develop, sandbox, production."
+              exit 1
+              ;;
+          esac
+
+      # --------- Validação de nome da branch de origem ----------
+      - name: Validate source branch naming (tipo/CODIGO-descricao)
+        shell: bash
+        run: |
+          set -euo pipefail
+          BRANCH="${GITHUB_HEAD_REF}"
+
+          # Só valida nomenclatura para branches "feature-like"
+          if [[ "$BRANCH" =~ ^(feature|bugfix|hotfix|release)/.+$ ]]; then
+            if [[ ! "$BRANCH" =~ ^(feature|bugfix|hotfix|release)/[A-Z]+[0-9]+-[a-z0-9-]+$ ]]; then
+              echo "❌ Nome de branch inválido: $BRANCH"
+              echo "   Formato esperado: tipo/CODIGO-descricao"
+              echo "   Ex.: feature/SLA0001-setup-of-project"
+              exit 1
+            fi
+            echo "✅ Nome da branch válido."
+          else
+            echo "ℹ️ Branch de origem não é feature/bugfix/hotfix/release; pulando validação de nome."
+          fi
+
+      # --------- Validar TÍTULO do PR ----------
+      - name: Validate PR title format
+        shell: bash
+        run: |
+          set -euo pipefail
+          TITLE=$(jq -r '.pull_request.title' < "$GITHUB_EVENT_PATH")
+          echo "PR Title: $TITLE"
+          if [[ ! "$TITLE" =~ ^\[[A-Z]+[0-9]+\]\ -\ .+ ]]; then
+            echo "❌ Título do PR inválido."
+            echo "   Formato esperado: [SLA0001] - Descrição do PR"
+            exit 1
+          fi
+          echo "✅ Título do PR válido."
+
+      # --------- Validar MENSAGENS DE COMMIT ----------
+      - name: Validate commit messages format
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE="${{ github.base_ref }}"
+
+          # Garante que a base existe localmente para o diff
+          git fetch origin "$BASE":"$BASE"
+
+          # Lista mensagens de commit do PR
+          mapfile -t COMMITS < <(git log "$BASE"..HEAD --pretty=format:%s)
+          if [[ "${#COMMITS[@]}" -eq 0 ]]; then
+            echo "ℹ️ Nenhum commit novo detectado."
+            exit 0
+          fi
+
+          INVALID=0
+          for MSG in "${COMMITS[@]}"; do
+            if [[ ! "$MSG" =~ ^\[[A-Z]+[0-9]+\]\ -\ .+ ]]; then
+              echo "❌ Commit inválido: $MSG"
+              echo "   Formato esperado: [SLA0001] - mensagem do commit"
+              INVALID=1
+            fi
+          done
+
+          if [[ "$INVALID" -ne 0 ]]; then
+            exit 1
+          fi
+          echo "✅ Todos os commits válidos."
+
+      # --------- Validar LABELS do PR ----------
+      - name: Validate PR labels (at least one valid)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Lê labels do payload
+          mapfile -t LABELS < <(jq -r '.pull_request.labels[].name' < "$GITHUB_EVENT_PATH")
+          echo "Labels do PR: ${LABELS[*]:-<nenhuma>}"
+
+          VALID_LABELS=(feature bugfix hotfix release)
+          FOUND=0
+          for L in "${LABELS[@]:-}"; do
+            for V in "${VALID_LABELS[@]}"; do
+              if [[ "$L" == "$V" ]]; then
+                FOUND=1
+              fi
+            done
+          done
+
+          if [[ "$FOUND" -eq 0 ]]; then
+            echo "❌ O PR precisa ter pelo menos uma label válida: ${VALID_LABELS[*]}"
+            exit 1
+          fi
+          echo "✅ Labels válidas."
